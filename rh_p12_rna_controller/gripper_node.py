@@ -24,6 +24,7 @@ from rcl_interfaces.msg import SetParametersResult
 from rh_p12_rna_controller.action import GripperCommand
 from dsr_msgs2.srv import DrlStart
 from sensor_msgs.msg import JointState
+from std_msgs.msg import String
 
 
 class ModbusRTU:
@@ -161,6 +162,8 @@ def build_drl_move_and_poll(
 DRL_SERVER_CODE = """\
 import socket
 import json
+import select
+import time
 
 SLAVE_ID = __SLAVE_ID__
 TCP_PORT = __TCP_PORT__
@@ -254,8 +257,61 @@ def _read_pos():
         # 2 reg read response: [id, 0x03, 0x04, hi1, lo1, hi2, lo2, crcLo, crcHi]
         else:
             if _sz >= 9 and _val[1] == 3 and _val[2] == 4:
-                return (((_val[3] << 8) | _val[4]) << 16) | ((_val[5] << 8) | _val[6])
+                # IMPORTANT: Modbus returns registers in increasing address order.
+                # Bridge implementation treats first word as LOW, second as HIGH (i32 = low + (high<<16)).
+                _low = ((_val[3] << 8) | _val[4])
+                _high = ((_val[5] << 8) | _val[6])
+                _v = _low + (_high << 16)
+                if _v >= 2147483648:
+                    _v = _v - 4294967296
+                return _v
     return -99999
+
+def _read_cur_pos_bulk():
+    # Bulk read if current/position regs are contiguous (reduces Modbus round trips).
+    try:
+        _pos_regs = int(PRESENT_POSITION_REGS)
+        if _pos_regs < 1:
+            _pos_regs = 1
+        _cur_reg = int(PRESENT_CURRENT_REG)
+        _pos_reg = int(PRESENT_POSITION_REG)
+        _start = _cur_reg if _cur_reg < _pos_reg else _pos_reg
+        _end = _cur_reg if _cur_reg > (_pos_reg + _pos_regs - 1) else (_pos_reg + _pos_regs - 1)
+        _count = (_end - _start) + 1
+        # keep request size small; fallback if too wide
+        if _count <= 0 or _count > 16:
+            return _read_cur(), _read_pos()
+        for _i in range(3):
+            _flush()
+            flange_serial_write(_fc03(_start, _count))
+            wait(0.05)
+            _sz, _val = flange_serial_read(0.3)
+            # response: [id, 0x03, bytecount, data..., crcLo, crcHi]
+            if _sz < (5 + 2*_count) or _val[1] != 3:
+                continue
+            _data = _val[3:3+2*_count]
+            # helpers
+            def _reg_u16(_addr):
+                _idx = _addr - _start
+                if _idx < 0 or _idx >= _count:
+                    return 0
+                return (_data[2*_idx] << 8) | _data[2*_idx + 1]
+            # current (signed 16-bit)
+            _cur_u = _reg_u16(_cur_reg)
+            _cur = _cur_u - 65536 if _cur_u > 32767 else _cur_u
+            # position (1 reg or 2 regs)
+            if _pos_regs == 1:
+                _pos = _reg_u16(_pos_reg)
+            else:
+                _low = _reg_u16(_pos_reg)
+                _high = _reg_u16(_pos_reg + 1)
+                _pos = _low + (_high << 16)
+                if _pos >= 2147483648:
+                    _pos = _pos - 4294967296
+            return _cur, _pos
+    except:
+        pass
+    return _read_cur(), _read_pos()
 
 # PLC Output Int GPR write helper
 # Doosan manual 9.5.x: Output Int GPR address range is 0~23
@@ -291,6 +347,10 @@ _flush()
 # 순수 파이썬 소켓으로 TCP 서버 열기 (Doosan 내장 API 사용 안 함)
 _srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 _srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+try:
+    _srv.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+except Exception:
+    pass
 _srv.bind(('0.0.0.0', TCP_PORT))
 _srv.listen(1)
 _srv.settimeout(30.0)
@@ -300,6 +360,10 @@ _conn = None
 try:
     _conn, _addr = _srv.accept()
     _conn.settimeout(0.05)
+    try:
+        _conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except Exception:
+        pass
 except Exception as _e:
     pass
 
@@ -328,36 +392,55 @@ if _conn:
     # Initial PLC code: 0=boot/idle
     _plc_write_int(PLC_ADDR_CODE, 0)
 
+    # event-driven command receive + rate-limited state stream
+    try:
+        _conn.setblocking(False)
+    except Exception:
+        pass
     _rxbuf = b""
-    while True:
-        # 1) ROS 명령 수신 (non-blocking) + length-framed JSON decode
-        _cmd_msgs = []
-        try:
-            _raw = _conn.recv(512)
-            # If peer closed, recv() returns b'' -> terminate server loop
-            if _raw == b'':
-                break
-            if _raw:
-                if b"STOP" in _raw:
+    _last_state_t = 0.0
+    STATE_PERIOD_SEC = 0.05  # 20 Hz default
+
+    def _drain_rx():
+        global _rxbuf
+        msgs = []
+        # Read everything currently available (non-blocking)
+        while True:
+            try:
+                r, _, _ = select.select([_conn], [], [], 0)
+                if not r:
                     break
-                _rxbuf += _raw
-                while len(_rxbuf) >= 2:
-                    _n = (_rxbuf[0] << 8) | _rxbuf[1]
-                    if len(_rxbuf) < 2 + _n:
-                        break
-                    _payload = _rxbuf[2:2+_n]
-                    _rxbuf = _rxbuf[2+_n:]
-                    try:
-                        _cmd_msgs.append(json.loads(_payload.decode('utf-8', errors='ignore')))
-                    except:
-                        pass
-        except socket.timeout:
-            pass
-        except Exception:
-            # connection reset / other socket errors -> stop server
+                _raw = _conn.recv(2048)
+                if _raw == b"":
+                    return None  # peer closed
+                if _raw:
+                    if b"STOP" in _raw:
+                        return "STOP"
+                    _rxbuf = _rxbuf + _raw
+            except Exception:
+                break
+
+        # Decode framed JSON messages
+        while len(_rxbuf) >= 2:
+            _n = (_rxbuf[0] << 8) | _rxbuf[1]
+            if len(_rxbuf) < 2 + _n:
+                break
+            _payload = _rxbuf[2:2+_n]
+            _rxbuf = _rxbuf[2+_n:]
+            try:
+                msgs.append(json.loads(_payload.decode('utf-8', errors='ignore')))
+            except:
+                pass
+        return msgs
+
+    while True:
+        # 1) Command receive (event-driven)
+        _cmd_msgs = _drain_rx()
+        if _cmd_msgs is None:
+            break
+        if _cmd_msgs == "STOP":
             break
 
-        # 2) 명령 있으면 실행 후 ACK 완전 소비 (핵심 버그픽스!)
         if _cmd_msgs:
             for _m in _cmd_msgs:
                 # ping/pong for protocol sanity check
@@ -373,18 +456,16 @@ if _conn:
                     for _hx in _frames:
                         _pkt = bytes.fromhex(_hx)
                         flange_serial_write(_pkt)
-                        wait(0.05)
+                        # keep waits minimal; flush consumes ACK residues
+                        wait(0.02)
                         _flush()
-                        wait(0.05)
                 except Exception as _e:
                     _ok = False
                     _err = str(_e)
-                # ACK는 최대한 빨리 전송 (타임아웃 방지)
+                # ACK ASAP
                 _send_obj({"type": "ack", "id": _cmd_id, "ok": _ok, "err": _err})
-                # PLC code: 1=last command ok, -1=last command error
                 _plc_write_int(PLC_ADDR_CODE, 1 if _ok else -1)
 
-                # Debug snapshot은 옵션 (무거워서 ACK/제어 지연 유발 가능)
                 if SNAP_ENABLED:
                     try:
                         _snap = {}
@@ -394,30 +475,31 @@ if _conn:
                     except:
                         pass
 
-        # 3) 버퍼 깨끗한 상태에서 읽기
-        cur_val = _read_cur()
-        pos_val = _read_pos()
-        if cur_val != -99999 and pos_val != -99999:
-            # PLC feedback (Output Int GPR)
-            _plc_write_int(PLC_ADDR_CUR, cur_val)
-            _plc_write_int(PLC_ADDR_POS, pos_val)
-            # gcur: GOAL_CURRENT(275) 레지스터가 실제로 바뀌는지 확인용
-            gcur = _read_reg16(GOAL_CUR_REG)
-            # gpos: goal position registers (configurable)
-            gpos_lo = _read_reg16(GOAL_POS_REG)
-            gpos_hi = _read_reg16(GOAL_POS_REG + 1)
-            _send_obj({
-                "type": "state",
-                "cur": cur_val,
-                "pos": pos_val,
-                "pcur_reg": PRESENT_CURRENT_REG,
-                "gcur_reg": GOAL_CUR_REG,
-                "gpos_reg": GOAL_POS_REG,
-                "gcur": gcur,
-                "gpos_lo": gpos_lo,
-                "gpos_hi": gpos_hi,
-            })
-            wait(0.05)
+        # 2) State stream (rate-limited)
+        _now = time.time()
+        if (_now - _last_state_t) >= STATE_PERIOD_SEC:
+            _last_state_t = _now
+            cur_val, pos_val = _read_cur_pos_bulk()
+            if cur_val != -99999 and pos_val != -99999:
+                _plc_write_int(PLC_ADDR_CUR, cur_val)
+                _plc_write_int(PLC_ADDR_POS, pos_val)
+                gcur = _read_reg16(GOAL_CUR_REG)
+                gpos_lo = _read_reg16(GOAL_POS_REG)
+                gpos_hi = _read_reg16(GOAL_POS_REG + 1)
+                _send_obj({
+                    "type": "state",
+                    "cur": cur_val,
+                    "pos": pos_val,
+                    "pcur_reg": PRESENT_CURRENT_REG,
+                    "gcur_reg": GOAL_CUR_REG,
+                    "gpos_reg": GOAL_POS_REG,
+                    "gcur": gcur,
+                    "gpos_lo": gpos_lo,
+                    "gpos_hi": gpos_hi,
+                })
+
+        # 3) tiny yield to avoid busy-loop
+        wait(0.005)
 
     _conn.close()
 
@@ -442,7 +524,8 @@ class GripperNode(Node):
         self.declare_parameter("tcp_external_server", False)
         self.declare_parameter("state_hz", 10.0)
         self.declare_parameter("grip_current_threshold", 50)
-        self.declare_parameter("position_scale", 64.0)
+        # Default: do not scale raw pos. Some firmware reports pulse*64; in that case set position_scale:=64.
+        self.declare_parameter("position_scale", 1.0)
         # position 파싱 옵션 (펌웨어/레지스터 맵 차이 대응)
         # - use_low_word: 32-bit 값 중 low 16-bit만 사용 (많이 쓰는 pulse*64가 여기에 있음)
         # - word_order: "hi_lo"(기본) 또는 "lo_hi" (32-bit 워드 조합 순서)
@@ -453,9 +536,15 @@ class GripperNode(Node):
         self.declare_parameter("command_transport", "drl")  # "drl" | "tcp"
         self.declare_parameter("slave_id", 1)
         self.declare_parameter("present_current_reg", 287)
-        self.declare_parameter("present_position_reg", 284)
-        self.declare_parameter("present_position_regs", 1)  # 1 or 2
-        self.declare_parameter("goal_current_reg", 276)
+        # RH-P12-RN(A) default map (matches bridge_compare):
+        # - present_velocity: 288~289
+        # - present_position: 290~291 (32-bit, low word then high word)
+        self.declare_parameter("present_position_reg", 290)
+        self.declare_parameter("present_position_regs", 2)  # 1 or 2
+        # RH-P12-RN(A) default map (matches bridge_compare):
+        # - goal_current: 275
+        # - goal_position: 282~283 (32-bit, low word then high word)
+        self.declare_parameter("goal_current_reg", 275)
         self.declare_parameter("goal_position_reg", 282)
         self.declare_parameter("goal_position_write_mode", "auto")  # auto|fc06|fc16
         self.declare_parameter("goal_position_regs", 2)  # 1 or 2
@@ -489,6 +578,9 @@ class GripperNode(Node):
         self.declare_parameter("cube_current", 300)
         # action name (so CLI path matches consistently)
         self.declare_parameter("action_name", "/rh_p12_rna_controller/gripper_command")
+        # direct (topic-based) immediate command interface
+        self.declare_parameter("direct_cmd_topic_enabled", False)
+        self.declare_parameter("direct_cmd_topic", "/gripper/cmd_direct")
 
         ns = str(self.get_parameter("robot_ns").value).strip()
         self._prefix = f"/{ns}" if ns else ""
@@ -533,6 +625,8 @@ class GripperNode(Node):
         self._cur_init = int(self.get_parameter("init_current").value)
         self._cur_cube = int(self.get_parameter("cube_current").value)
         self._action_name = str(self.get_parameter("action_name").value).strip()
+        self._direct_cmd_enabled = bool(self.get_parameter("direct_cmd_topic_enabled").value)
+        self._direct_cmd_topic = str(self.get_parameter("direct_cmd_topic").value).strip() or "/gripper/cmd_direct"
 
         # Validate PLC Output Int GPR addresses (0~23). We clamp only if enabled.
         if self._plc_feedback_enabled:
@@ -571,6 +665,17 @@ class GripperNode(Node):
         self._state_pub = self.create_publisher(JointState, "/gripper/state", 10)
         self.create_timer(1.0 / self._state_hz, self._publish_state, callback_group=self._cb)
 
+        self._direct_sub = None
+        if self._direct_cmd_enabled:
+            self._direct_sub = self.create_subscription(
+                String,
+                self._direct_cmd_topic,
+                self._on_direct_cmd,
+                10,
+                callback_group=self._cb,
+            )
+            self.get_logger().info(f"direct cmd topic enabled: {self._direct_cmd_topic} (std_msgs/String)")
+
         self._executing = False
         self._action_server = ActionServer(
             self,
@@ -588,6 +693,106 @@ class GripperNode(Node):
         if self._tcp_wd_enabled:
             self._watchdog_thread = threading.Thread(target=self._tcp_watchdog_loop, daemon=True)
             self._watchdog_thread.start()
+
+    def _resolve_preset_action(self, action: str, pulse: int = 0, current: int = 0) -> tuple[int, int]:
+        a = (action or "").strip()
+        if a in ("open", "release"):
+            return self._pulse_open, self._cur_init
+        if a == "grab_cube":
+            return self._pulse_cube, self._cur_cube
+        if a == "grab_rotate":
+            return self._pulse_rotate, self._cur_cube
+        if a == "grab_repose":
+            return self._pulse_repose, self._cur_cube
+        if a == "custom":
+            p = int(pulse) if int(pulse) > 0 else self._pulse_cube
+            c = int(current) if int(current) > 0 else self._cur_init
+            return p, c
+        return -1, -1
+
+    def _on_direct_cmd(self, msg: String) -> None:
+        """Immediate, best-effort command path.
+
+        Payload examples:
+        - "open"
+        - "grab_cube"
+        - "custom 420 300"  (action pulse current)
+        """
+        raw = (msg.data or "").strip()
+        if not raw:
+            return
+        parts = raw.split()
+        action = parts[0]
+        pulse = int(parts[1]) if len(parts) >= 2 else 0
+        current = int(parts[2]) if len(parts) >= 3 else 0
+        t_pulse, t_cur = self._resolve_preset_action(action, pulse=pulse, current=current)
+        if t_pulse == -1:
+            self.get_logger().warn(f"direct cmd rejected: {raw!r}")
+            return
+
+        # Run async so we don't block subscription callback.
+        threading.Thread(
+            target=self._direct_cmd_worker,
+            args=(action, t_pulse, t_cur),
+            daemon=True,
+        ).start()
+
+    def _direct_cmd_worker(self, action: str, t_pulse: int, t_cur: int) -> None:
+        try:
+            self.get_logger().info(f"direct cmd: action={action} pos={t_pulse} cur={t_cur}")
+            cur_pkt = ModbusRTU.fc06(self._slave_id, self._goal_cur_reg, int(t_cur))
+            goal_val = int(round(float(t_pulse) * (self._goal_pos_scale if self._goal_pos_scale else 1.0)))
+            pos_pkt_fc06 = ModbusRTU.fc06(self._slave_id, self._goal_pos_reg, int(goal_val) & 0xFFFF)
+            pos_pkt_fc16 = ModbusRTU.fc16(self._slave_id, self._goal_pos_reg, 2, [int(goal_val) & 0xFFFF, 0])
+
+            if self._cmd_transport == "drl":
+                drl_code = build_drl_move_and_poll(
+                    slave_id=self._slave_id,
+                    target_pulse=int(t_pulse),
+                    target_current=int(t_cur),
+                    grip_current_threshold=int(self._grip_threshold),
+                    pos_tolerance=int(self._done_tol),
+                    max_loops=60,
+                )
+                ok = self._call_drl(drl_code, timeout_sec=15.0)
+                self.get_logger().info(f"direct cmd done(drl): ok={ok}")
+                return
+
+            # TCP mode
+            if not self._socket_active:
+                self.get_logger().warn("direct cmd failed: TCP offline")
+                return
+            ok1, err1 = self._send_cmd_and_wait_ack([cur_pkt], timeout_sec=None)
+            if not ok1:
+                self.get_logger().error(f"direct cmd cur ack failed: {err1}")
+                return
+            time.sleep(0.02)
+
+            regs = int(self._goal_pos_regs)
+            mode = str(self._goal_pos_write_mode)
+            if regs <= 1:
+                ok2, err2 = self._send_cmd_and_wait_ack([pos_pkt_fc06], timeout_sec=None)
+                if not ok2:
+                    self.get_logger().error(f"direct cmd pos(fc06) ack failed: {err2}")
+                return
+
+            sent = False
+            if mode in ("fc06", "auto"):
+                ok2, err2 = self._send_cmd_and_wait_ack([pos_pkt_fc06], timeout_sec=None)
+                if ok2:
+                    sent = True
+                elif mode == "fc06":
+                    self.get_logger().error(f"direct cmd pos(fc06) ack failed: {err2}")
+                    return
+            if (not sent) and mode in ("fc16", "auto"):
+                ok3, err3 = self._send_cmd_and_wait_ack([pos_pkt_fc16], timeout_sec=None)
+                if not ok3:
+                    self.get_logger().error(f"direct cmd pos(fc16) ack failed: {err3}")
+                    return
+                sent = True
+            self.get_logger().info(f"direct cmd sent(tcp): ok={sent}")
+        except Exception as e:
+            self.get_logger().error(f"direct cmd exception: {e}")
 
     def _clamp_plc_out_int_addr(self, addr: int, name: str) -> int:
         a = int(addr)
